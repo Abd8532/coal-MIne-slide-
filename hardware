@@ -1,0 +1,1319 @@
+// code for ESP 32 FOR HARDWARE CONCEPT 
+// ESP 32 
+// ACCELOMETER 
+// BUZZER 
+// NODE 1 
+
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <time.h>
+#include <math.h>
+
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+
+// =====================================================
+// WIFI CONFIG
+// =====================================================
+
+const char* WIFI_SSID = "EBD";
+const char* WIFI_PASSWORD = "12345678";
+
+// =====================================================
+// BACKEND CONFIG
+// =====================================================
+
+const char* SERVER_URL =
+    "http://10.247.73.140:8000/api/v1/ingest";
+
+// =====================================================
+// NODE CONFIG
+// =====================================================
+
+const char* NODE_ID = "N02";
+
+// =====================================================
+// PIN DEFINITIONS
+// =====================================================
+
+// ADXL345
+#define SDA_PIN 23
+#define SCL_PIN 22
+
+// HC-SR04
+#define TRIG_PIN 18
+#define ECHO_PIN 36
+
+// KY-006 Passive Buzzer
+#define BUZZER_PIN 25
+
+// ESP32 Built-in LED
+#define LED_PIN 2
+
+// =====================================================
+// ADXL345 OBJECT
+// =====================================================
+
+Adafruit_ADXL345_Unified accel =
+    Adafruit_ADXL345_Unified(12345);
+
+// =====================================================
+// THRESHOLDS
+// =====================================================
+
+// Prototype values only.
+// These are NOT real mine-safety limits.
+
+const float TILT_THRESHOLD = 10.0;
+const float DISPLACEMENT_THRESHOLD = 2.0;
+
+// =====================================================
+// VARIABLES
+// =====================================================
+
+float referenceDistance = 0.0;
+
+unsigned long startMillis = 0;
+unsigned long lastSendTime = 0;
+
+const unsigned long SEND_INTERVAL = 5000;
+
+// =====================================================
+// RISK STATE
+// =====================================================
+
+String previousRiskLevel = "LOW";
+
+// =====================================================
+// READ HC-SR04 DISTANCE
+// =====================================================
+
+float readDistance()
+{
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration =
+        pulseIn(
+            ECHO_PIN,
+            HIGH,
+            30000
+        );
+
+    // No echo received
+    if (duration == 0)
+    {
+        return -1.0;
+    }
+
+    float distance =
+        (duration * 0.0343) / 2.0;
+
+    return distance;
+}
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi()
+{
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        digitalWrite(LED_PIN, HIGH);
+        return;
+    }
+
+    Serial.println();
+    Serial.println("Connecting to Wi-Fi...");
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.disconnect();
+
+    delay(500);
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+    );
+
+    int attempts = 0;
+
+    while (
+        WiFi.status() != WL_CONNECTED &&
+        attempts < 30
+    )
+    {
+        // Blink LED
+        digitalWrite(
+            LED_PIN,
+            !digitalRead(LED_PIN)
+        );
+
+        Serial.print(".");
+
+        delay(500);
+
+        attempts++;
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        // Connected = LED ON
+        digitalWrite(LED_PIN, HIGH);
+
+        Serial.println(
+            "Wi-Fi connected!"
+        );
+
+        Serial.print(
+            "ESP32 IP: "
+        );
+
+        Serial.println(
+            WiFi.localIP()
+        );
+
+        Serial.print(
+            "ESP32 MAC: "
+        );
+
+        Serial.println(
+            WiFi.macAddress()
+        );
+    }
+    else
+    {
+        // Failed = LED OFF
+        digitalWrite(LED_PIN, LOW);
+
+        Serial.println(
+            "Wi-Fi connection FAILED."
+        );
+
+        Serial.print(
+            "Wi-Fi status: "
+        );
+
+        Serial.println(
+            WiFi.status()
+        );
+    }
+}
+
+// =====================================================
+// NTP TIME
+// =====================================================
+
+void setupTime()
+{
+    if (
+        WiFi.status() != WL_CONNECTED
+    )
+    {
+        Serial.println(
+            "Skipping time synchronization."
+        );
+
+        return;
+    }
+
+    configTime(
+        0,
+        0,
+        "pool.ntp.org",
+        "time.nist.gov"
+    );
+
+    Serial.println(
+        "Synchronizing time..."
+    );
+
+    struct tm timeinfo;
+
+    if (
+        getLocalTime(
+            &timeinfo,
+            10000
+        )
+    )
+    {
+        Serial.println(
+            "Time synchronized."
+        );
+
+        char buffer[30];
+
+        strftime(
+            buffer,
+            sizeof(buffer),
+            "%Y-%m-%dT%H:%M:%SZ",
+            &timeinfo
+        );
+
+        Serial.print(
+            "UTC Time: "
+        );
+
+        Serial.println(
+            buffer
+        );
+    }
+    else
+    {
+        Serial.println(
+            "Time synchronization FAILED."
+        );
+    }
+}
+
+// =====================================================
+// GET TIMESTAMP
+// =====================================================
+
+String getTimestamp()
+{
+    struct tm timeinfo;
+
+    if (
+        getLocalTime(
+            &timeinfo,
+            1000
+        )
+    )
+    {
+        char buffer[30];
+
+        strftime(
+            buffer,
+            sizeof(buffer),
+            "%Y-%m-%dT%H:%M:%SZ",
+            &timeinfo
+        );
+
+        return String(buffer);
+    }
+
+    // Simple fallback
+    unsigned long seconds =
+        (millis() - startMillis) / 1000;
+
+    return String(
+        "1970-01-01T00:00:"
+    ) +
+    String(seconds);
+}
+
+// =====================================================
+// CALCULATE TILT
+// =====================================================
+
+float calculateTilt(
+    float X,
+    float Y,
+    float Z
+)
+{
+    float tilt =
+        atan2(
+            sqrt(
+                X * X +
+                Y * Y
+            ),
+            fabs(Z)
+        )
+        * 180.0 /
+        PI;
+
+    return tilt;
+}
+
+// =====================================================
+// READ ADXL345
+// =====================================================
+
+void readADXL345(
+    float &tilt,
+    float &vibration
+)
+{
+    sensors_event_t event;
+
+    accel.getEvent(
+        &event
+    );
+
+    // Acceleration values in m/s²
+
+    float X =
+        event.acceleration.x;
+
+    float Y =
+        event.acceleration.y;
+
+    float Z =
+        event.acceleration.z;
+
+    // Convert to g
+
+    float ax =
+        X / 9.80665;
+
+    float ay =
+        Y / 9.80665;
+
+    float az =
+        Z / 9.80665;
+
+    // Calculate tilt
+
+    tilt =
+        calculateTilt(
+            ax,
+            ay,
+            az
+        );
+
+    // Calculate acceleration magnitude
+
+    float magnitude =
+        sqrt(
+            ax * ax +
+            ay * ay +
+            az * az
+        );
+
+    // Approximate vibration
+
+    vibration =
+        fabs(
+            magnitude - 1.0
+        );
+}
+
+// =====================================================
+// CALCULATE RISK SCORE
+// =====================================================
+
+int calculateRisk(
+    float tilt,
+    float displacement
+)
+{
+    int riskScore = 0;
+
+    // Tilt
+
+    if (
+        tilt >
+        TILT_THRESHOLD
+    )
+    {
+        riskScore += 3;
+    }
+
+    // Displacement
+
+    if (
+        displacement >
+        DISPLACEMENT_THRESHOLD
+    )
+    {
+        riskScore += 3;
+    }
+
+    return riskScore;
+}
+
+// =====================================================
+// GET RISK LEVEL
+// =====================================================
+
+String getRiskLevel(
+    int riskScore
+)
+{
+    if (
+        riskScore >= 5
+    )
+    {
+        return "HIGH";
+    }
+    else if (
+        riskScore >= 2
+    )
+    {
+        return "MEDIUM";
+    }
+    else
+    {
+        return "LOW";
+    }
+}
+
+// =====================================================
+// KY-006 BUZZER
+//
+// LOW    = SILENT
+// MEDIUM = ONE BEEP ON ENTERING MEDIUM
+// HIGH   = CONTINUOUS
+// =====================================================
+
+void updateBuzzer(
+    String riskLevel
+)
+{
+    // =================================================
+    // LOW
+    // =================================================
+
+    if (
+        riskLevel == "LOW"
+    )
+    {
+        noTone(
+            BUZZER_PIN
+        );
+
+        Serial.println(
+            "Buzzer: OFF"
+        );
+    }
+
+    // =================================================
+    // MEDIUM
+    // =================================================
+
+    else if (
+        riskLevel == "MEDIUM"
+    )
+    {
+        // Beep only when entering MEDIUM
+
+        if (
+            previousRiskLevel !=
+            "MEDIUM"
+        )
+        {
+            Serial.println(
+                "Buzzer: MEDIUM - ONE BEEP"
+            );
+
+            tone(
+                BUZZER_PIN,
+                2000
+            );
+
+            delay(500);
+
+            noTone(
+                BUZZER_PIN
+            );
+        }
+    }
+
+    // =================================================
+    // HIGH
+    // =================================================
+
+    else if (
+        riskLevel == "HIGH"
+    )
+    {
+        Serial.println(
+            "Buzzer: HIGH - CONTINUOUS"
+        );
+
+        tone(
+            BUZZER_PIN,
+            2000
+        );
+    }
+
+    // Save current state
+
+    previousRiskLevel =
+        riskLevel;
+}
+
+// =====================================================
+// SEND DATA TO BACKEND
+// =====================================================
+
+void sendData(
+    float distance,
+    float displacement,
+    float tilt,
+    float vibration,
+    int riskScore,
+    String riskLevel
+)
+{
+    // -------------------------------------------------
+    // WIFI CHECK
+    // -------------------------------------------------
+
+    if (
+        WiFi.status() !=
+        WL_CONNECTED
+    )
+    {
+        Serial.println(
+            "Wi-Fi disconnected."
+        );
+
+        connectWiFi();
+
+        if (
+            WiFi.status() !=
+            WL_CONNECTED
+        )
+        {
+            Serial.println(
+                "Telemetry not sent."
+            );
+
+            return;
+        }
+    }
+
+    // -------------------------------------------------
+    // TIMESTAMP
+    // -------------------------------------------------
+
+    String timestamp =
+        getTimestamp();
+
+    // -------------------------------------------------
+    // HTTP CLIENT
+    // -------------------------------------------------
+
+    HTTPClient http;
+
+    http.begin(
+        SERVER_URL
+    );
+
+    http.addHeader(
+        "Content-Type",
+        "application/json"
+    );
+
+    http.setTimeout(
+        5000
+    );
+
+    // -------------------------------------------------
+    // JSON
+    // -------------------------------------------------
+
+    String json = "{";
+
+    json +=
+        "\"node_id\":\"";
+
+    json +=
+        NODE_ID;
+
+    json +=
+        "\",";
+
+    json +=
+        "\"timestamp\":\"";
+
+    json +=
+        timestamp;
+
+    json +=
+        "\",";
+
+    // -------------------------------------------------
+    // DISTANCE
+    // -------------------------------------------------
+
+    // IMPORTANT:
+    // Never send negative distance.
+    // Backend requires distance >= 0.
+
+    float safeDistance = distance;
+
+    if (safeDistance < 0)
+    {
+        safeDistance = 0.0;
+    }
+
+    json +=
+        "\"distance\":";
+
+    json +=
+        String(
+            safeDistance,
+            2
+        );
+
+    json +=
+        ",";
+
+    // -------------------------------------------------
+    // DISTANCE CHANGE
+    // -------------------------------------------------
+
+    float safeDisplacement =
+        displacement;
+
+    if (safeDisplacement < 0)
+    {
+        safeDisplacement = 0.0;
+    }
+
+    json +=
+        "\"distance_change\":";
+
+    json +=
+        String(
+            safeDisplacement,
+            2
+        );
+
+    json +=
+        ",";
+
+    // -------------------------------------------------
+    // TILT
+    // -------------------------------------------------
+
+    json +=
+        "\"tilt\":";
+
+    json +=
+        String(
+            tilt,
+            2
+        );
+
+    json +=
+        ",";
+
+    // -------------------------------------------------
+    // VIBRATION
+    // -------------------------------------------------
+
+    json +=
+        "\"vibration\":";
+
+    json +=
+        String(
+            vibration,
+            4
+        );
+
+    json +=
+        ",";
+
+    // -------------------------------------------------
+    // RISK SCORE
+    // -------------------------------------------------
+
+    json +=
+        "\"risk_score\":";
+
+    json +=
+        String(
+            riskScore
+        );
+
+    json +=
+        ",";
+
+    // -------------------------------------------------
+    // RISK LEVEL
+    // -------------------------------------------------
+
+    json +=
+        "\"risk_level\":\"";
+
+    json +=
+        riskLevel;
+
+    json +=
+        "\"";
+
+    json +=
+        "}";
+
+    // -------------------------------------------------
+    // SERIAL OUTPUT
+    // -------------------------------------------------
+
+    Serial.println();
+
+    Serial.println(
+        "========== TELEMETRY =========="
+    );
+
+    Serial.println(
+        json
+    );
+
+    // -------------------------------------------------
+    // POST
+    // -------------------------------------------------
+
+    int responseCode =
+        http.POST(
+            json
+        );
+
+    Serial.print(
+        "HTTP Response Code: "
+    );
+
+    Serial.println(
+        responseCode
+    );
+
+    if (
+        responseCode > 0
+    )
+    {
+        String response =
+            http.getString();
+
+        Serial.println(
+            "Server Response:"
+        );
+
+        Serial.println(
+            response
+        );
+
+        if (
+            responseCode >= 200 &&
+            responseCode < 300
+        )
+        {
+            Serial.println(
+                ">>> DATA SENT SUCCESSFULLY <<<"
+            );
+        }
+        else
+        {
+            Serial.println(
+                ">>> SERVER ERROR <<<"
+            );
+        }
+    }
+    else
+    {
+        Serial.print(
+            "HTTP Error: "
+        );
+
+        Serial.println(
+            http.errorToString(
+                responseCode
+            )
+        );
+    }
+
+    http.end();
+
+    Serial.println(
+        "================================"
+    );
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+    Serial.begin(
+        115200
+    );
+
+    delay(1000);
+
+    startMillis =
+        millis();
+
+    // -------------------------------------------------
+    // HEADER
+    // -------------------------------------------------
+
+    Serial.println();
+
+    Serial.println(
+        "================================"
+    );
+
+    Serial.println(
+        "       MINEGUARD NODE 02"
+    );
+
+    Serial.println(
+        "       ESP32 + ADXL345"
+    );
+
+    Serial.println(
+        "================================"
+    );
+
+    // -------------------------------------------------
+    // LED
+    // -------------------------------------------------
+
+    pinMode(
+        LED_PIN,
+        OUTPUT
+    );
+
+    digitalWrite(
+        LED_PIN,
+        LOW
+    );
+
+    // -------------------------------------------------
+    // HC-SR04
+    // -------------------------------------------------
+
+    Serial.println(
+        "[1] Initializing HC-SR04..."
+    );
+
+    pinMode(
+        TRIG_PIN,
+        OUTPUT
+    );
+
+    pinMode(
+        ECHO_PIN,
+        INPUT
+    );
+
+    digitalWrite(
+        TRIG_PIN,
+        LOW
+    );
+
+    Serial.println(
+        "[OK] HC-SR04 initialized."
+    );
+
+    // -------------------------------------------------
+    // BUZZER
+    // -------------------------------------------------
+
+    Serial.println(
+        "[2] Initializing KY-006..."
+    );
+
+    pinMode(
+        BUZZER_PIN,
+        OUTPUT
+    );
+
+    noTone(
+        BUZZER_PIN
+    );
+
+    Serial.println(
+        "[OK] KY-006 initialized."
+    );
+
+    // -------------------------------------------------
+    // I2C
+    // -------------------------------------------------
+
+    Serial.println(
+        "[3] Initializing I2C..."
+    );
+
+    Wire.begin(
+        SDA_PIN,
+        SCL_PIN
+    );
+
+    Serial.println(
+        "[OK] I2C initialized."
+    );
+
+    // -------------------------------------------------
+    // ADXL345
+    // -------------------------------------------------
+
+    Serial.println(
+        "[4] Initializing ADXL345..."
+    );
+
+    if (
+        !accel.begin()
+    )
+    {
+        Serial.println(
+            "[ERROR] ADXL345 NOT FOUND!"
+        );
+
+        Serial.println(
+            "Check:"
+        );
+
+        Serial.println(
+            "VCC -> 3.3V"
+        );
+
+        Serial.println(
+            "GND -> GND"
+        );
+
+        Serial.println(
+            "SDA -> GPIO 23"
+        );
+
+        Serial.println(
+            "SCL -> GPIO 22"
+        );
+
+        // Error blink
+
+        while (1)
+        {
+            digitalWrite(
+                LED_PIN,
+                HIGH
+            );
+
+            delay(200);
+
+            digitalWrite(
+                LED_PIN,
+                LOW
+            );
+
+            delay(200);
+        }
+    }
+
+    accel.setRange(
+        ADXL345_RANGE_16_G
+    );
+
+    Serial.println(
+        "[OK] ADXL345 connected."
+    );
+
+    // -------------------------------------------------
+    // BUZZER TEST
+    // -------------------------------------------------
+
+    Serial.println(
+        "[5] Testing buzzer..."
+    );
+
+    tone(
+        BUZZER_PIN,
+        2000
+    );
+
+    delay(1000);
+
+    noTone(
+        BUZZER_PIN
+    );
+
+    Serial.println(
+        "[OK] Buzzer test completed."
+    );
+
+    // -------------------------------------------------
+    // WIFI
+    // -------------------------------------------------
+
+    Serial.println(
+        "[6] Connecting Wi-Fi..."
+    );
+
+    connectWiFi();
+
+    // -------------------------------------------------
+    // TIME
+    // -------------------------------------------------
+
+    Serial.println(
+        "[7] Synchronizing time..."
+    );
+
+    setupTime();
+
+    // -------------------------------------------------
+    // REFERENCE DISTANCE
+    // -------------------------------------------------
+
+    Serial.println(
+        "[8] Taking reference distance..."
+    );
+
+    delay(1000);
+
+    float initialDistance =
+        readDistance();
+
+    if (
+        initialDistance > 0
+    )
+    {
+        referenceDistance =
+            initialDistance;
+
+        Serial.print(
+            "Reference Distance: "
+        );
+
+        Serial.print(
+            referenceDistance
+        );
+
+        Serial.println(
+            " cm"
+        );
+    }
+    else
+    {
+        Serial.println(
+            "[WARNING] HC-SR04 returned -1."
+        );
+
+        Serial.println(
+            "Check ECHO wiring and voltage divider."
+        );
+
+        // Keep reference at 0.
+        // System will not calculate displacement
+        // until a valid reading is available.
+        referenceDistance =
+            0;
+    }
+
+    // -------------------------------------------------
+    // READY
+    // -------------------------------------------------
+
+    Serial.println();
+
+    Serial.println(
+        "================================"
+    );
+
+    Serial.println(
+        "       NODE N02 READY"
+    );
+
+    Serial.println(
+        "================================"
+    );
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+    // =================================================
+    // READ HC-SR04
+    // =================================================
+
+    float distance =
+        readDistance();
+
+    // =================================================
+    // DISPLACEMENT
+    // =================================================
+
+    float displacement =
+        0.0;
+
+    // Only calculate displacement
+    // when BOTH readings are valid.
+
+    if (
+        distance >= 0 &&
+        referenceDistance > 0
+    )
+    {
+        displacement =
+            fabs(
+                distance -
+                referenceDistance
+            );
+    }
+
+    // =================================================
+    // READ ADXL345
+    // =================================================
+
+    float tilt =
+        0.0;
+
+    float vibration =
+        0.0;
+
+    readADXL345(
+        tilt,
+        vibration
+    );
+
+    // =================================================
+    // RISK SCORE
+    // =================================================
+
+    int riskScore =
+        calculateRisk(
+            tilt,
+            displacement
+        );
+
+    // =================================================
+    // RISK LEVEL
+    // =================================================
+
+    String riskLevel =
+        getRiskLevel(
+            riskScore
+        );
+
+    // =================================================
+    // BUZZER
+    // =================================================
+
+    updateBuzzer(
+        riskLevel
+    );
+
+    // =================================================
+    // SERIAL MONITOR
+    // =================================================
+
+    Serial.println();
+
+    Serial.println(
+        "--------------------------------"
+    );
+
+    Serial.print(
+        "Node ID       : "
+    );
+
+    Serial.println(
+        NODE_ID
+    );
+
+    Serial.print(
+        "Distance      : "
+    );
+
+    if (distance >= 0)
+    {
+        Serial.print(
+            distance
+        );
+
+        Serial.println(
+            " cm"
+        );
+    }
+    else
+    {
+        Serial.println(
+            "INVALID"
+        );
+    }
+
+    Serial.print(
+        "Displacement  : "
+    );
+
+    Serial.print(
+        displacement
+    );
+
+    Serial.println(
+        " cm"
+    );
+
+    Serial.print(
+        "Tilt          : "
+    );
+
+    Serial.print(
+        tilt
+    );
+
+    Serial.println(
+        " degrees"
+    );
+
+    Serial.print(
+        "Vibration     : "
+    );
+
+    Serial.println(
+        vibration
+    );
+
+    Serial.print(
+        "Risk Score    : "
+    );
+
+    Serial.println(
+        riskScore
+    );
+
+    Serial.print(
+        "Risk Level    : "
+    );
+
+    Serial.println(
+        riskLevel
+    );
+
+    Serial.println(
+        "--------------------------------"
+    );
+
+    // =================================================
+    // SEND EVERY 5 SECONDS
+    // =================================================
+
+    if (
+        millis() -
+        lastSendTime >=
+        SEND_INTERVAL
+    )
+    {
+        lastSendTime =
+            millis();
+
+        sendData(
+            distance,
+            displacement,
+            tilt,
+            vibration,
+            riskScore,
+            riskLevel
+        );
+    }
+
+    delay(200);
+}
